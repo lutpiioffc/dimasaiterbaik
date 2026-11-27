@@ -1,0 +1,104 @@
+const express = require('express');
+const axios = require('axios');
+const router = express.Router();
+const providers = require('../config/providers');
+
+// ─── Helper: resolve API key (env → encrypted storage) ───
+function resolveApiKey(providerId, req) {
+  const envKey = process.env[providerId.toUpperCase() + '_API_KEY'];
+  if (envKey) return envKey;
+  const stored = req.app.locals.loadStoredKeys();
+  if (stored[providerId]) {
+    try { return req.app.locals.decrypt(stored[providerId]); } catch (e) { return null; }
+  }
+  return null;
+}
+
+// ─── GET /api/ai/providers ───
+router.get('/providers', (req, res) => {
+  const list = Object.entries(providers).map(([id, p]) => ({
+    id, name: p.name, models: p.models,
+    supportsStream: p.supportsStream, supportsVision: p.supportsVision,
+    hasKey: !!resolveApiKey(id, req)
+  }));
+  res.json(list);
+});
+
+// ─── POST /api/ai/keys ─── save API key ───
+router.post('/keys', (req, res) => {
+  const { providerId, apiKey } = req.body;
+  if (!providers[providerId]) return res.status(400).json({ error: 'Provider tidak dikenal' });
+  if (!apiKey || apiKey.trim().length < 5) return res.status(400).json({ error: 'API key tidak valid' });
+
+  const stored = req.app.locals.loadStoredKeys();
+  stored[providerId] = req.app.locals.encrypt(apiKey.trim());
+  req.app.locals.saveStoredKeys(stored);
+  res.json({ success: true, message: API key ${providers[providerId].name} tersimpan });
+});
+
+// ─── DELETE /api/ai/keys/:providerId ─── hapus API key ───
+router.delete('/keys/:providerId', (req, res) => {
+  const stored = req.app.locals.loadStoredKeys();
+  delete stored[req.params.providerId];
+  req.app.locals.saveStoredKeys(stored);
+  res.json({ success: true, message: 'API key dihapus' });
+});
+
+// ─── POST /api/ai/test ─── test connection ───
+router.post('/test', async (req, res) => {
+  const { providerId, model } = req.body;
+  const provider = providers[providerId];
+  if (!provider) return res.status(400).json({ error: 'Provider tidak dikenal' });
+
+  const apiKey = resolveApiKey(providerId, req);
+  if (!apiKey) return res.status(400).json({ error: 'API key belum dikonfigurasi' });
+
+  try {
+    const response = await callProvider(providerId, provider, apiKey, {
+      model: model || provider.models[0],
+      messages: [{ role: 'user', content: 'Hi' }],
+      max_tokens: 5,
+      stream: false
+    });
+    res.json({ success: true, status: 'connected', model: model || provider.models[0], preview: response.slice(0, 80) });
+  } catch (err) {
+    res.status(502).json({ success: false, status: 'error', error: extractError(err) });
+  }
+});
+
+// ─── POST /api/ai/chat ─── streaming chat ───
+router.post('/chat', async (req, res) => {
+  const { providerId, model, messages, stream = true, images } = req.body;
+  const provider = providers[providerId];
+  if (!provider) return res.status(400).json({ error: 'Provider tidak dikenal' });
+
+  const apiKey = resolveApiKey(providerId, req);
+  if (!apiKey) return res.status(400).json({ error: API key ${provider.name} belum dikonfigurasi });
+
+  try {
+    if (stream && provider.supportsStream) {
+      await streamChat(providerId, provider, apiKey, { model, messages, images }, res);
+    } else {
+      const result = await callProvider(providerId, provider, apiKey, { model, messages, images, stream: false });
+      res.json({ content: result });
+    }
+  } catch (err) {
+    if (!res.headersSent) res.status(502).json({ error: extractError(err) });
+  }
+});
+
+// ─── Stream handler ───
+async function streamChat(providerId, provider, apiKey, opts, res) {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  try {
+    const { url, headers, body } = buildRequest(providerId, provider, apiKey, { ...opts, stream: true });
+
+    const response = await axios.post(url, body, {
+      headers,
+      responseType: 'stream',
+      timeout: 120000
+    });
